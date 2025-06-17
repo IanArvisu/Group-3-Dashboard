@@ -1,6 +1,6 @@
 streamlit
 pandas
 numpy
-tensorflow
+tensorflow==2.16.0
 matplotlib
 seaborn
