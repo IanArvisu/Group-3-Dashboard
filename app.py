@@ -178,21 +178,26 @@ if page == "Live Parameters":
     except Exception as e:
         st.error(f"❌ Live prediction failed: {e}")
 
-# === Page 2 ===
 elif page == "Actual vs Predicted":
     st.header(f"📈 Actual vs Predicted Graphs — {model_name} ({location})")
+    st.caption(f"Aggregation Interval: **{interval}**")
+    
     for col in target_columns + ["WQI"]:
         fig, ax = plt.subplots(figsize=(10, 4))
         actual = df_agg[col]
         predicted = df_agg.get(f"Predicted_{col}")
+        
         if predicted is not None:
             sns.lineplot(data=actual, label="Actual", ax=ax)
             sns.lineplot(data=predicted, label="Predicted", ax=ax, linestyle="--")
-        ax.set_title(col)
-        ax.set_xlabel("Date")
+
+        ax.set_title(f"{col} ({interval})")
+        ax.set_xlabel(f"Date")
         ax.set_ylabel(col)
         ax.grid(True)
+        ax.legend()
         st.pyplot(fig)
+
 
 # === Page 3 ===
 elif page == "Metrics Table":
