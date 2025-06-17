@@ -4,3 +4,4 @@ numpy
 tensorflow==2.19.0
 matplotlib
 seaborn
+scikit-learn
