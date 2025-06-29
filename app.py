@@ -1,137 +1,96 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import tensorflow as tf
+import os
 import matplotlib.pyplot as plt
-import seaborn as sns
-from tensorflow.keras.models import load_model
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-st.set_page_config("Water Quality Dashboard", layout="wide")
-
-@st.cache_resource
-def load_model_file(model_path):
-    return load_model(model_path)
-
-@st.cache_data(ttl=0)
-def load_and_preprocess_data():
-    df = pd.read_csv("preprocessed_data.csv")
-    df["Date"] = pd.to_datetime(df["Date"])
-    df["Month"] = df["Date"].dt.month
-    df["Month_sin"] = np.sin(2 * np.pi * df["Month"] / 12)
-    df["Month_cos"] = np.cos(2 * np.pi * df["Month"] / 12)
-
-    target_columns = [
-        "Dissolved Oxygen (mg/L)",
-        "pH Level",
-        "Ammonia (mg/L)",
-        "Nitrate-N/Nitrite-N  (mg/L)",
-        "Phosphate (mg/L)"
+# --- CONFIGURATION ---
+MODEL_DIR = "models"
+MODELS = {
+    "Water Parameters Only": "cnn_lstm_water.h5",
+    "Water + Climate Activity Parameters": "cnn_lstm_water+climate.h5",
+    "Water + Volcanic Activity Parameters": "cnn_lstm_water+volcanic.h5",
+    "Water + Climate + Volcanic Activity Parameters": "cnn_lstm_water+climate+volcanic.h5"
+}
+FEATURES = {
+    "Water Parameters Only": ['Surface Water Temp (°C)', 'Middle Water Temp (°C)', 'Bottom Water Temp (°C)', 'pH Level', 'Dissolved Oxygen (mg/L)'],
+    "Water + Climate Activity Parameters": ['Surface Water Temp (°C)', 'Middle Water Temp (°C)', 'Bottom Water Temp (°C)', 'pH Level', 'Dissolved Oxygen (mg/L)', 'RAINFALL', 'TMAX', 'TMIN', 'RH', 'WIND_SPEED', 'WIND_DIRECTION'],
+    "Water + Volcanic Activity Parameters": ['Surface Water Temp (°C)', 'Middle Water Temp (°C)', 'Bottom Water Temp (°C)', 'pH Level', 'Dissolved Oxygen (mg/L)', 'CO2_Flux', 'SO2_Flux'],
+    "Water + Climate + Volcanic Activity Parameters": [
+        col for col in [
+            'Surface Water Temp (°C)', 'Middle Water Temp (°C)', 'Bottom Water Temp (°C)',
+            'pH Level', 'Dissolved Oxygen (mg/L)', 'RAINFALL', 'TMAX', 'TMIN', 'RH',
+            'WIND_SPEED', 'WIND_DIRECTION', 'CO2_Flux', 'SO2_Flux'
+        ] if col in pd.read_csv("cleaned_normalized_combined_data.csv").columns
     ]
+}
+TARGETS = ['Ammonia (mg/L)', 'Nitrate-N/Nitrite-N  (mg/L)', 'Phosphate (mg/L)']
+LOOKBACK = 12
 
-    grouped = df.groupby("Location")
-    all_processed = {}
+# --- LOAD DATA ---
+@st.cache_data
+def load_data():
+    return pd.read_csv("cleaned_normalized_combined_data.csv")
 
-    for loc, group in grouped:
-        group = group.sort_values("Date").copy()
-        group.drop(columns=["Month"], inplace=True, errors="ignore")
-        for col in group.columns:
-            if col not in target_columns + ["Date", "Location"]:
-                group[f"{col}_lag1"] = group[col].shift(1)
-                group[f"{col}_lag2"] = group[col].shift(2)
-                group[f"{col}_roll3"] = group[col].rolling(3).mean()
-        group.replace([np.inf, -np.inf], np.nan, inplace=True)
-        group.dropna(inplace=True)
-        group.reset_index(drop=True, inplace=True)
-        all_processed[loc] = group
+df = load_data()
+df["Standardized_Date"] = pd.to_datetime(df["Standardized_Date"])
+df = df.sort_values(["Location", "Standardized_Date"])
+locations = df["Location"].unique().tolist()
 
-    return all_processed, target_columns
+# --- STREAMLIT UI ---
+st.title("Water Quality Prediction Dashboard")
+st.sidebar.header("Input Configuration")
 
-def create_sequences(data, targets, time_steps=24):
-    Xs, ys = [], []
-    for i in range(len(data) - time_steps):
-        Xs.append(data[i:i+time_steps])
-        ys.append(targets[i+time_steps])
-    return np.array(Xs), np.array(ys)
+input_type = st.sidebar.selectbox("Select input variable set:", list(MODELS.keys()))
+selected_location = st.sidebar.selectbox("Select location:", locations)
+interval = st.sidebar.radio("Select interval:", ["Monthly", "Yearly"])
 
-def compute_wqi(subset):
-    norm_cols = subset.copy()
-    for col in norm_cols.columns:
-        norm_cols[col] = (norm_cols[col] - norm_cols[col].min()) / (norm_cols[col].max() - norm_cols[col].min())
-    return norm_cols.mean(axis=1)
+filtered = df[df["Location"] == selected_location].copy()
+features = FEATURES[input_type]
 
-# === Sidebar Controls ===
-data_by_location, target_columns = load_and_preprocess_data()
-
-model_name = st.sidebar.selectbox("Select Model", ["CNN", "LSTM", "Hybrid"])
-location = st.sidebar.selectbox("Select Location", list(data_by_location.keys()))
-interval = st.sidebar.selectbox("Aggregation Interval", ["Weekly", "Monthly", "Yearly"])
-page = st.sidebar.radio("Navigation", ["Live Parameters", "Actual vs Predicted", "Metrics Table"])
-
-model_path = {
-    "CNN": "cnn_model.h5",
-    "LSTM": "lstm_model.h5",
-    "Hybrid": "hybrid_model.h5"
-}[model_name]
-
-# === Load Model ===
-try:
-    model = load_model_file(model_path)
-except Exception as e:
-    st.error(f"❌ Error loading model: {e}")
-    st.stop()
-
-# === Prepare Data ===
-df = data_by_location[location]
-lookback = 24
-
-if df.shape[0] <= lookback:
-    st.error("❌ Not enough data for prediction. Please select a different location.")
-    st.stop()
-
-feature_columns = [col for col in df.columns if col not in target_columns + ["Date", "Location"]]
-X_all = df[feature_columns].values
-X_all = np.nan_to_num(X_all, nan=0.0, posinf=0.0, neginf=0.0)
-y_all = df[target_columns].values
-X_seq, y_seq = create_sequences(X_all, y_all, time_steps=lookback)
-
-# === Run Prediction ===
-try:
-    y_pred = model.predict(X_seq)
-except Exception as e:
-    st.error(f"❌ Prediction error: {e}")
-    st.write("X_seq shape:", X_seq.shape)
-    st.write("Any NaNs:", np.isnan(X_seq).any())
-    st.write("Preview of X_seq[0]:", X_seq[0] if len(X_seq) else "Empty")
-    st.stop()
-
-# === Postprocess ===
-df_pred = df.iloc[lookback:].copy()
-df_pred[target_columns] = y_seq
-for i, col in enumerate(target_columns):
-    df_pred[f"Predicted_{col}"] = y_pred[:, i]
-
-df_pred["WQI"] = compute_wqi(df_pred[target_columns])
-df_pred["Predicted_WQI"] = compute_wqi(df_pred[[f"Predicted_{col}" for col in target_columns]])
-
-if interval == "Weekly":
-    df_agg = df_pred.resample("W", on="Date").mean(numeric_only=True)
-elif interval == "Monthly":
-    df_agg = df_pred.resample("M", on="Date").mean(numeric_only=True)
+data_seq = filtered[features].tail(LOOKBACK)
+if len(data_seq) < LOOKBACK:
+    st.warning(f"Not enough data to predict. Need at least {LOOKBACK} time steps.")
 else:
-    df_agg = df_pred.resample("Y", on="Date").mean(numeric_only=True)
+    X_input = np.expand_dims(data_seq.values, axis=0)
+    model_path = os.path.join(MODEL_DIR, MODELS[input_type])
 
-# === Page 1 ===
-if page == "Live Parameters":
-    st.header("🧪 Live Predicted Water Quality Parameters")
-    last_input = df[feature_columns].tail(lookback).values.reshape(1, lookback, len(feature_columns))
+    if not os.path.exists(model_path):
+        st.error(f"Model not found: {model_path}")
+    else:
+        model = tf.keras.models.load_model(model_path, compile=False)
+        prediction = model.predict(X_input)[0]
 
-    try:
-        live_pred = model.predict(last_input)[0]
-        wqi_inputs = {}
-        for i, col in enumerate(target_columns):
-            value = live_pred[i]
-            st.metric(label=col, value=f"{value:.3f}")
-            wqi_inputs[col] = value
+        st.subheader("Predicted Water Quality Levels")
+        for i, target in enumerate(TARGETS):
+            st.metric(label=target, value=f"{prediction[i]:.4f}")
+
+        # --- Graph Interpretation ---
+        st.subheader("📈 Recent Trends of Water Quality Parameters")
+        fig, ax = plt.subplots(figsize=(8, 4))
+        recent_dates = filtered["Standardized_Date"].tail(LOOKBACK)
+        for feature in features:
+            if feature in filtered.columns:
+                ax.plot(recent_dates, filtered[feature].tail(LOOKBACK), label=feature)
+
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Value")
+        ax.set_title(f"Recent Parameter Trends at {selected_location}")
+        ax.legend(loc="upper left", fontsize="small")
+        ax.grid(True)
+        st.pyplot(fig)
+
+        # --- WQI Interpretation ---
+        st.subheader("💧 Water Quality Index (WQI)")
+
+        wqi_inputs = {
+            "Dissolved Oxygen (mg/L)": filtered['Dissolved Oxygen (mg/L)'].iloc[-1] if 'Dissolved Oxygen (mg/L)' in filtered.columns else 7.0,
+            "pH Level": filtered['pH Level'].iloc[-1] if 'pH Level' in filtered.columns else 7.0,
+            "Ammonia (mg/L)": prediction[0],
+            "Nitrate-N/Nitrite-N  (mg/L)": prediction[1],
+            "Phosphate (mg/L)": prediction[2],
+        }
 
         weights = {
             "Dissolved Oxygen (mg/L)": 0.3,
@@ -170,45 +129,5 @@ if page == "Live Parameters":
             interpretation = "Water quality is severely impacted and generally unsafe."
             color = "🔴"
 
-        st.markdown("---")
-        st.subheader("💧 Water Quality Index (WQI)")
         st.metric(label="WQI Score", value=f"{wqi:.2f}", delta=status)
         st.info(f"{color} **Interpretation:** {interpretation}")
-
-    except Exception as e:
-        st.error(f"❌ Live prediction failed: {e}")
-
-elif page == "Actual vs Predicted":
-    st.header(f"📈 Actual vs Predicted Graphs — {model_name} ({location})")
-    st.caption(f"Aggregation Interval: **{interval}**")
-    
-    for col in target_columns + ["WQI"]:
-        fig, ax = plt.subplots(figsize=(10, 4))
-        actual = df_agg[col]
-        predicted = df_agg.get(f"Predicted_{col}")
-        
-        if predicted is not None:
-            sns.lineplot(data=actual, label="Actual", ax=ax)
-            sns.lineplot(data=predicted, label="Predicted", ax=ax, linestyle="--")
-
-        ax.set_title(f"{col} ({interval})")
-        ax.set_xlabel(f"Date")
-        ax.set_ylabel(col)
-        ax.grid(True)
-        ax.legend()
-        st.pyplot(fig)
-
-
-# === Page 3 ===
-elif page == "Metrics Table":
-    st.header(f"📊 Evaluation Metrics — {model_name} ({location})")
-    metrics = {"Parameter": [], "MAE": [], "MSE": [], "R² Score": []}
-    for i, col in enumerate(target_columns):
-        y_true = y_seq[:, i]
-        y_hat = y_pred[:, i]
-        metrics["Parameter"].append(col)
-        metrics["MAE"].append(round(mean_absolute_error(y_true, y_hat), 4))
-        metrics["MSE"].append(round(mean_squared_error(y_true, y_hat), 4))
-        metrics["R² Score"].append(round(r2_score(y_true, y_hat), 4))
-
-    st.dataframe(pd.DataFrame(metrics), use_container_width=True)
